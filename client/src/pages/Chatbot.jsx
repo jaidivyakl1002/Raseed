@@ -225,10 +225,10 @@ const Chatbot = () => {
   }, [activeChatIndex, isThinking]);
 
   const quickQuestions = [
-    { label: "Summarize My Receipts", bg: "bg-blue-500" },
-    { label: "What Did I Spend The Most On?", bg: "bg-red-500" },
-    { label: "Any Unusual Expenses?", bg: "bg-green-500" },
-    { label: "How Can I Save More?", bg: "bg-yellow-500" },
+    { label: "Summarize My ReceiptsHow", bg: "bg-blue-500" },
+    { label: "My Least 2 Spending Categories", bg: "bg-red-500" },
+    { label: "Compare My Spendings From Last Four Months", bg: "bg-green-500" },
+    { label: "My Spending Pattern", bg: "bg-yellow-500" },
   ];
 
   return (

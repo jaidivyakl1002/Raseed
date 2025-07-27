@@ -23,7 +23,7 @@ const Hero = () => {
         <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-12 items-center">
           <div className="space-y-6 text-center md:text-left">
             <h1 className="text-3xl sm:text-4xl md:text-5xl lg:text-6xl font-extrabold leading-tight tracking-tight">
-              Get AI-powered insights from your meetings & receipts — instantly
+              Get AI-powered insights from your receipts — instantly
             </h1>
             <p className="text-base sm:text-lg md:text-xl text-gray-600 max-w-xl mx-auto md:mx-0">
               Raseed organizes your transactions, extracts patterns, and gives

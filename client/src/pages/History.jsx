@@ -206,7 +206,10 @@ const History = () => {
                     setSelectedReceipt(r);
                     setDialogOpen(true);
                   }}
-                  onDelete={() => confirmDelete(receipt.id)}
+                  onDelete={() => {
+                    confirmDelete(receipt.id)
+                    console.log(receipt);
+                  }}
                 />
               ))
             )}
