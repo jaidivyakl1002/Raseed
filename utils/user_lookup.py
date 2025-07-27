@@ -7,7 +7,25 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 import os
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.environ.get("FIREBASE_CREDENTIALS")
+import tempfile
+google_credentials_env = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+
+try:
+    if not google_credentials_env:
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS env variable is missing.")
+
+    if google_credentials_env.strip().startswith("{"):
+        # Write to temp file
+        temp_cred = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        temp_cred.write(google_credentials_env.encode())
+        temp_cred.flush()
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_cred.name
+    else:
+        # Assume it's already a file path
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = google_credentials_env
+
+except Exception as e:
+    raise RuntimeError(f"Could not process Google credentials: {e}")
 
 async def get_user_id_by_firebase_uid(
     firebase_uid: str,
