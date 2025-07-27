@@ -88,76 +88,69 @@ class PredictionResult:
     days_until_overage: int
     recommended_daily_limit: Decimal
 
-class ContinuousMonitoringTool:
-    """
-    Tool for continuous monitoring of user spending data, budget thresholds,
-    and pattern detection.
-    """
+from google.cloud import secretmanager
+import json
 
-    def __init__(self, db_connection_string: str):
-        self.db_connection_string = db_connection_string
+class ContinuousMonitoringTool:
+    def __init__(
+        self,
+        project_id: str,
+        logger: Optional[logging.Logger] = None
+    ):
+        self.logger = logger or logging.getLogger(__name__)
+        self.project_id = project_id
         self.connection_pool: Optional[asyncpg.Pool] = None
-        self.logger = logging.getLogger(__name__)
-        
-        # Default monitoring schedules
-        self.default_schedules = {
-            'budget_critical': {
-                'frequency': MonitoringFrequency.HOURLY,
-                'trigger_condition': 'budget_usage > 90%',
-                'analysis_depth': 'detailed',
-                'priority': 10
-            },
-            'budget_warning': {
-                'frequency': MonitoringFrequency.DAILY,
-                'trigger_condition': 'budget_usage > 75%',
-                'analysis_depth': 'standard',
-                'priority': 7
-            },
-            'pattern_analysis': {
-                'frequency': MonitoringFrequency.WEEKLY,
-                'trigger_condition': 'always',
-                'analysis_depth': 'comprehensive',
-                'priority': 5
-            },
-            'seasonal_review': {
-                'frequency': MonitoringFrequency.MONTHLY,
-                'trigger_condition': 'month_boundary',
-                'analysis_depth': 'historical_comparison',
-                'priority': 4
-            },
-            'goal_tracking': {
-                'frequency': MonitoringFrequency.DAILY,
-                'trigger_condition': 'active_goals_exist',
-                'analysis_depth': 'progress_focused',
-                'priority': 6
-            }
+        self.secret_client = secretmanager.SecretManagerServiceClient()
+
+        # Get database config from Secret Manager (same as PostgreSQL tool)
+        secret_name = f"projects/{self.project_id}/secrets/postgres-config/versions/latest"
+        response = self.secret_client.access_secret_version(request={"name": secret_name})
+        secret_data = json.loads(response.payload.data.decode("UTF-8"))
+
+        self.db_config = {
+            'host': secret_data["host"],
+            'port': secret_data.get("port", 5432),
+            'database': secret_data["database"],
+            'user': secret_data["user"],
+            'password': secret_data["password"],
+            'min_size': 5,
+            'max_size': 20,
+            'command_timeout': 60
         }
 
-    async def initialize(self):
+    async def initialize_connection_pool(self):
         """Initialize the database connection pool."""
         try:
-            self.connection_pool = await asyncpg.create_pool(
-                self.db_connection_string,
-                min_size=5,
-                max_size=20,
-                command_timeout=30
-            )
-            self.logger.info("Database connection pool initialized")
+            if not self.connection_pool:
+                self.connection_pool = await asyncpg.create_pool(**self.db_config)
+                self.logger.info("PostgreSQL connection pool initialized successfully")
         except Exception as e:
-            self.logger.error(f"Failed to initialize database pool: {str(e)}")
+            self.logger.error(f"Failed to initialize connection pool: {e}")
             raise
 
-    async def close(self):
+    async def close_connection_pool(self):
         """Close the database connection pool."""
         if self.connection_pool:
             await self.connection_pool.close()
-            self.logger.info("Database connection pool closed")
+            self.connection_pool = None
+            self.logger.info("PostgreSQL connection pool closed")
+    
+    async def initialize(self):
+        """Initialize the database connection pool."""
+        await self.initialize_connection_pool()
+
+    async def close(self):
+        """Close the database connection pool."""
+        await self.close_connection_pool()
 
     # === Analysis Scheduling Methods ===
 
     async def schedule_user_analysis(self, user_id: str, analysis_type: AnalysisType, priority: int = 5) -> bool:
         """Schedule analysis for a specific user and analysis type."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+            
             async with self.connection_pool.acquire() as conn:
                 # Get user preferences for monitoring frequency
                 user_prefs = await self._get_user_monitoring_preferences(conn, user_id)
@@ -187,6 +180,9 @@ class ContinuousMonitoringTool:
     async def get_next_analysis_time(self, user_id: str, analysis_type: AnalysisType) -> Optional[datetime]:
         """Get the next scheduled analysis time for a user and analysis type."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+            
             async with self.connection_pool.acquire() as conn:
                 query = """
                 SELECT next_run_time FROM monitoring_schedules 
@@ -202,6 +198,9 @@ class ContinuousMonitoringTool:
     async def should_run_analysis(self, user_id: str, analysis_type: AnalysisType) -> bool:
         """Check if analysis should be run based on schedule and conditions."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+            
             async with self.connection_pool.acquire() as conn:
                 # Get schedule info
                 query = """
@@ -232,6 +231,9 @@ class ContinuousMonitoringTool:
     async def update_analysis_schedule(self, user_id: str, new_schedule: Dict[str, Any]) -> bool:
         """Update analysis schedule for a user."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+            
             async with self.connection_pool.acquire() as conn:
                 # Update monitoring preferences
                 query = """
@@ -265,6 +267,9 @@ class ContinuousMonitoringTool:
     async def check_budget_status(self, user_id: str, category: str = None) -> List[BudgetStatus]:
         """Check current budget status for user, optionally filtered by category."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+
             async with self.connection_pool.acquire() as conn:
                 # Build query based on whether category is specified
                 if category:
@@ -391,6 +396,9 @@ class ContinuousMonitoringTool:
     async def calculate_spending_velocity(self, user_id: str, time_period: str = "30d") -> Dict[str, float]:
         """Calculate spending velocity (amount per day) for different categories."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+
             async with self.connection_pool.acquire() as conn:
                 # Parse time period
                 if time_period.endswith('d'):
@@ -471,6 +479,9 @@ class ContinuousMonitoringTool:
     async def get_budget_utilization_trends(self, user_id: str) -> Dict[str, Any]:
         """Get budget utilization trends over time."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+
             async with self.connection_pool.acquire() as conn:
                 query = """
                 WITH monthly_spending AS (
@@ -539,6 +550,9 @@ class ContinuousMonitoringTool:
     async def analyze_spending_patterns(self, user_id: str, lookback_days: int = 90) -> PatternAnalysis:
         """Analyze spending patterns for a user over a specified period."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+
             async with self.connection_pool.acquire() as conn:
                 end_date = date.today()
                 start_date = end_date - timedelta(days=lookback_days)
@@ -585,6 +599,9 @@ class ContinuousMonitoringTool:
     async def detect_pattern_changes(self, user_id: str, baseline_period: str = "3m") -> List[Dict[str, Any]]:
         """Detect changes in spending patterns compared to a baseline period."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+
             async with self.connection_pool.acquire() as conn:
                 # Parse baseline period
                 if baseline_period.endswith('m'):
@@ -667,6 +684,9 @@ class ContinuousMonitoringTool:
     async def compare_seasonal_patterns(self, user_id: str, current_period: str = "current_month") -> Dict[str, Any]:
         """Compare current spending to seasonal patterns from previous years."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+            
             async with self.connection_pool.acquire() as conn:
                 current_month = datetime.now().month
                 
@@ -742,6 +762,9 @@ class ContinuousMonitoringTool:
     async def identify_emerging_trends(self, user_id: str, sensitivity: float = 0.7) -> List[Dict[str, Any]]:
         """Identify emerging spending trends based on recent data."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+            
             async with self.connection_pool.acquire() as conn:
                 query = """
                 WITH daily_spending AS (
@@ -1340,6 +1363,9 @@ class ContinuousMonitoringTool:
     async def cleanup_old_schedules(self, days_old: int = 30) -> int:
         """Clean up old monitoring schedules that are no longer active."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+
             async with self.connection_pool.acquire() as conn:
                 query = """
                 DELETE FROM monitoring_schedules 
@@ -1360,6 +1386,9 @@ class ContinuousMonitoringTool:
     async def update_schedule_after_analysis(self, user_id: str, analysis_type: AnalysisType) -> bool:
         """Update schedule after completing an analysis."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+            
             async with self.connection_pool.acquire() as conn:
                 # Get current schedule
                 query = """
@@ -1401,6 +1430,9 @@ class ContinuousMonitoringTool:
     async def get_monitoring_status(self, user_id: str) -> Dict[str, Any]:
         """Get comprehensive monitoring status for a user."""
         try:
+            if not self.connection_pool:
+                await self.initialize_connection_pool()
+            
             async with self.connection_pool.acquire() as conn:
                 query = """
                 SELECT 

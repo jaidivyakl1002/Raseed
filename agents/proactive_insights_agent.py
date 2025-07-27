@@ -8,7 +8,6 @@ from enum import Enum
 import uuid
 from core.proactive_agent_tools.anomaly_detection_tool import AnomalyDetectionTool, AnomalyType as AnomalyToolType, AnomalySeverity as AnomalyToolSeverity, AnomalyPolarity
 from vertexai.generative_models import GenerativeModel, Tool, FunctionDeclaration
-from core.base_agent_tools.database_connector import DatabaseConnector
 from core.base_agent_tools.config_manager import AgentConfig
 from core.base_agent_tools.vertex_initializer import VertexAIInitializer
 from core.base_agent_tools.integration_coordinator import IntegrationCoordinator
@@ -39,6 +38,22 @@ class InsightSeverity(Enum):
     MEDIUM = "medium"
     HIGH = "high"
     CRITICAL = "critical"
+
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+
+# Add this response model class after the existing dataclasses
+class ProactiveInsightsResponse(BaseModel):
+    """Standardized response model for proactive insights agent."""
+    success: bool = True
+    predictions: Dict[str, Any] = {}
+    insights: List[Dict[str, Any]] = []
+    notifications: List[Dict[str, Any]] = []
+    analysis_metadata: Dict[str, Any] = {}
+    error: Optional[str] = None
+    
+    class Config:
+        arbitrary_types_allowed = True
 
 
 @dataclass
@@ -84,7 +99,6 @@ class ProactiveInsightsAgent:
         project_id: Optional[str] = None,
         location: Optional[str] = None,
         model_name: Optional[str] = None,
-        db_connection_string: Optional[str] = None
     ):
         # Initialize configuration
         self.agent_name = agent_name
@@ -97,30 +111,16 @@ class ProactiveInsightsAgent:
         self.logger = self._setup_logging()
         
         # Initialize shared tools
-        self.db_connector = DatabaseConnector()
         self.integration_coordinator = IntegrationCoordinator()
         self.error_handler = ErrorHandler(self.logger)
         self.user_profile_manager = UserProfileManager()
         
         # Initialize Tools
-        self.db_connection_string = db_connection_string or self.system_config.database_url
-        self.monitoring_tool = ContinuousMonitoringTool(self.db_connection_string)
-        self.anomaly_detection_tool = AnomalyDetectionTool(self.db_connector)
-        self.trend_prediction_tool = TrendPredictionTool(
-            db_connector=self.db_connector,
-            config=self.system_config
-        )
-        self.timing_optimization_tool = TimingOptimizationTool(
-            project_id=self.project_id,
-            location=self.location,
-            model_name=self.model_name
-        )
-        self.notification_generation_tool = NotificationGenerationTool(
-            db_connection_string=self.db_connection_string,
-            project_id=self.project_id,
-            location=self.location,
-            model_name=self.model_name
-        )
+        self.monitoring_tool = ContinuousMonitoringTool(self.project_id,self.logger)
+        self.anomaly_detection_tool = AnomalyDetectionTool(self.project_id, self.logger)
+        self.trend_prediction_tool = TrendPredictionTool(self.project_id, self.logger)
+        self.timing_optimization_tool = TimingOptimizationTool(self.project_id, self.logger)
+        self.notification_generation_tool = NotificationGenerationTool(self.project_id, self.logger)
         
         # Initialize Vertex AI
         VertexAIInitializer.initialize(self.project_id, self.location)
@@ -199,7 +199,10 @@ class ProactiveInsightsAgent:
             analysis_type = input_data.get('analysis_type', 'general')
             
             if not user_id:
-                raise ValueError("user_id is required for proactive insights generation")
+                return ProactiveInsightsResponse(
+                    success=False,
+                    error="user_id is required for proactive insights generation"
+                ).dict()
             
             # Get user profile and preferences
             user_profile = await self.user_profile_manager.get_profile(user_id)
@@ -235,109 +238,37 @@ class ProactiveInsightsAgent:
             # Store insights for future reference
             await self._store_insights(optimized_insights)
             
-            return {
-                "predictions": predictions,
-                "insights": [self._insight_to_dict(insight) for insight in optimized_insights],
-                "notifications": notifications,  # Add this line
-                "analysis_metadata": {
+            # Return standardized response
+            response = ProactiveInsightsResponse(
+                success=True,
+                predictions=predictions,
+                insights=[self._insight_to_dict(insight) for insight in optimized_insights],
+                notifications=notifications,
+                analysis_metadata={
                     "analysis_type": analysis_type,
                     "insights_generated": len(optimized_insights),
-                    "notifications_generated": len(notifications),  # Add this line
+                    "notifications_generated": len(notifications),
                     "user_id": user_id,
                     "timestamp": datetime.now().isoformat(),
                     "agent": self.agent_name
                 }
-            }
+            )
+            
+            return response
             
         except Exception as e:
             self.logger.error(f"Error in proactive insights processing: {str(e)}")
-            return await self.error_handler.handle_error(e, {
-                "agent": self.agent_name,
-                "input_data": input_data,
-                "operation": "process"
-            })
-    
-    async def _generate_notifications_from_insights(self, insights: List[ProactiveInsight]) -> List[Dict[str, Any]]:
-        """Generate notifications from proactive insights using the notification generation tool."""
-        notifications = []
-        
-        try:
-            # Map insight types to notification types
-            insight_to_notification_mapping = {
-                InsightType.BUDGET_ALERT: NotifType.BUDGET_ALERT,
-                InsightType.SPENDING_ANOMALY: NotifType.SPENDING_INSIGHT,
-                InsightType.TREND_WARNING: NotifType.SPENDING_INSIGHT,
-                InsightType.GOAL_UPDATE: NotifType.GOAL_UPDATE,
-                InsightType.OPPORTUNITY: NotifType.RECOMMENDATION,
-                InsightType.SEASONAL_REMINDER: NotifType.SEASONAL_REMINDER,
-                InsightType.CELEBRATION: NotifType.CELEBRATION
-            }
-            
-            # Prepare notification generation requests
-            notification_requests = []
-            for insight in insights:
-                notification_type = insight_to_notification_mapping.get(
-                    insight.insight_type, 
-                    NotifType.SPENDING_INSIGHT
-                )
-                
-                # Determine template based on insight specifics
-                template_id = self._select_template_id(insight)
-                
-                notification_request = {
-                    'user_id': insight.user_id,
-                    'notification_type': notification_type.value,
-                    'template_id': template_id,
-                    'insight_data': {
-                        'insight_id': insight.insight_id,
-                        'insight_type': insight.insight_type.value,
-                        'severity': insight.severity.value,
-                        'title': insight.title,
-                        'message': insight.message,
-                        'data_points': insight.data_points,
-                        'recommendations': insight.recommendations,
-                        'confidence_score': insight.confidence_score,
-                        'relevance_score': insight.relevance_score
-                    },
-                    'custom_data': {
-                        'optimal_timing': insight.optimal_timing.isoformat(),
-                        'expires_at': insight.expires_at.isoformat() if insight.expires_at else None,
-                        'metadata': insight.metadata or {}
-                    }
+            error_response = ProactiveInsightsResponse(
+                success=False,
+                error=str(e),
+                analysis_metadata={
+                    "agent": self.agent_name,
+                    "user_id": input_data.get('user_id'),
+                    "timestamp": datetime.now().isoformat(),
+                    "operation": "process"
                 }
-                notification_requests.append(notification_request)
-            
-            # Generate notifications in batch for efficiency
-            if notification_requests:
-                generated_notifications = await self.notification_generation_tool.generate_batch_notifications(
-                    notification_requests
-                )
-                
-                # Convert to dict format for return
-                for notif in generated_notifications:
-                    notifications.append({
-                        'notification_id': notif.notification_id,
-                        'user_id': notif.user_id,
-                        'notification_type': notif.notification_type.value,
-                        'title': notif.title,
-                        'message': notif.message,
-                        'rich_content': notif.rich_content,
-                        'priority': notif.priority.value,
-                        'channels': [ch.value for ch in notif.channels],
-                        'action_buttons': notif.action_buttons,
-                        'data_visualization': notif.data_visualization,
-                        'quick_actions': notif.quick_actions,
-                        'expires_at': notif.expires_at.isoformat() if notif.expires_at else None,
-                        'metadata': notif.metadata
-                    })
-                
-                self.logger.info(f"Generated {len(notifications)} notifications from {len(insights)} insights")
-            
-        except Exception as e:
-            self.logger.error(f"Error generating notifications from insights: {str(e)}")
-            # Continue without notifications - insights are still valuable
-        
-        return notifications
+            )
+            return error_response.dict()
     
     def _select_template_id(self, insight: ProactiveInsight) -> str:
         """Select appropriate notification template based on insight characteristics."""
@@ -629,114 +560,6 @@ class ProactiveInsightsAgent:
         
         return insights
     
-    async def _predict_spending_trends(self, user_id: str, historical_analysis: Dict[str, Any], prediction_context: Dict[str, Any]) -> List[ProactiveInsight]:
-        """Predict future spending trends using the TrendPredictionTool."""
-        insights = []
-        
-        try:
-            # Extract parameters from context
-            categories = prediction_context.get('categories', None)
-            prediction_types = prediction_context.get('prediction_types', None)
-            horizon_days = prediction_context.get('horizon_days', 90)
-            
-            # Get trend predictions from the tool
-            trend_predictions = await self.trend_prediction_tool.predict_trends(
-                user_id=user_id,
-                categories=categories,
-                prediction_types=prediction_types,
-                horizon_days=horizon_days
-            )
-            
-            # Convert trend predictions to proactive insights
-            for prediction in trend_predictions:
-                # Map severity levels
-                severity_mapping = {
-                    TrendToolSeverity.CRITICAL: InsightSeverity.CRITICAL,
-                    TrendToolSeverity.HIGH: InsightSeverity.HIGH,
-                    TrendToolSeverity.MEDIUM: InsightSeverity.MEDIUM,
-                    TrendToolSeverity.LOW: InsightSeverity.LOW
-                }
-                
-                # Map trend types to insight types
-                insight_type_mapping = {
-                    TrendType.SPENDING_INCREASE: InsightType.TREND_WARNING,
-                    TrendType.SPENDING_DECREASE: InsightType.OPPORTUNITY,
-                    TrendType.SEASONAL_PATTERN: InsightType.SEASONAL_REMINDER,
-                    TrendType.BUDGET_CHALLENGE: InsightType.BUDGET_ALERT,
-                    TrendType.EMERGING_CATEGORY: InsightType.OPPORTUNITY,
-                    TrendType.BEHAVIOR_SHIFT: InsightType.TREND_WARNING,
-                    TrendType.MERCHANT_LOYALTY: InsightType.OPPORTUNITY,
-                    TrendType.PAYMENT_METHOD_SHIFT: InsightType.OPPORTUNITY
-                }
-                
-                # Generate recommendations from prediction actions
-                recommendations = []
-                
-                # Add preparation actions
-                for action in prediction.preparation_actions:
-                    recommendations.append({
-                        "type": "preparation",
-                        "action": action.get("action", ""),
-                        "description": action.get("description", ""),
-                        "priority": action.get("priority", "medium"),
-                        "estimated_impact": action.get("estimated_impact", "")
-                    })
-                
-                # Add mitigation strategies
-                for strategy in prediction.mitigation_strategies:
-                    recommendations.append({
-                        "type": "mitigation",
-                        "strategy": strategy.get("strategy", ""),
-                        "description": strategy.get("description", ""),
-                        "effort": strategy.get("effort", "medium"),
-                        "potential_savings": strategy.get("potential_savings", "")
-                    })
-                
-                # Add opportunities
-                for opportunity in prediction.opportunities:
-                    recommendations.append({
-                        "type": "opportunity",
-                        "opportunity": opportunity.get("opportunity", ""),
-                        "description": opportunity.get("description", ""),
-                        "potential_benefit": opportunity.get("potential_benefit", ""),
-                        "action_required": opportunity.get("action_required", "")
-                    })
-                
-                insight = ProactiveInsight(
-                    insight_id=str(uuid.uuid4()),
-                    user_id=user_id,
-                    insight_type=insight_type_mapping.get(prediction.trend_type, InsightType.TREND_WARNING),
-                    severity=severity_mapping.get(prediction.severity, InsightSeverity.MEDIUM),
-                    title=prediction.title,
-                    message=prediction.description,
-                    data_points={
-                        "category": prediction.category,
-                        "trend_type": prediction.trend_type.value,
-                        "predicted_impact": prediction.predicted_impact,
-                        "timeline": prediction.timeline,
-                        "confidence_score": prediction.confidence_score,
-                        "statistical_evidence": prediction.statistical_evidence,
-                        "model_metrics": prediction.model_metrics
-                    },
-                    recommendations=recommendations,
-                    confidence_score=prediction.confidence_score,
-                    relevance_score=self._calculate_relevance_score(prediction),
-                    optimal_timing=datetime.now(),
-                    expires_at=prediction.valid_until,
-                    metadata={
-                        "prediction_id": prediction.prediction_id,
-                        "model_used": prediction.model_used,
-                        "data_quality_score": prediction.data_quality_score,
-                        "historical_data": prediction.historical_data
-                    }
-                )
-                insights.append(insight)
-            
-        except Exception as e:
-            self.logger.error(f"Error predicting spending trends with TrendPredictionTool: {str(e)}")
-        
-        return insights
-    
     def _calculate_relevance_score(self, prediction) -> float:
         """Calculate relevance score based on prediction characteristics."""
         base_score = 0.7
@@ -900,133 +723,6 @@ class ProactiveInsightsAgent:
             self.logger.error(f"Error filtering insights: {str(e)}")
             return insights[:3]  # Return top 3 as fallback
     
-    async def _optimize_insight_timing(self, insights: List[ProactiveInsight], user_profile: Dict[str, Any]) -> List[ProactiveInsight]:
-        """Optimize timing for insight delivery using the TimingOptimizationTool."""
-        try:
-            if not insights:
-                return insights
-            
-            self.logger.info(f"Optimizing timing for {len(insights)} insights")
-            
-            # Prepare notifications data for batch optimization
-            notifications_data = []
-            for insight in insights:
-                # Map insight severity to notification urgency
-                urgency_mapping = {
-                    InsightSeverity.CRITICAL: NotificationUrgency.IMMEDIATE,
-                    InsightSeverity.HIGH: NotificationUrgency.HIGH,
-                    InsightSeverity.MEDIUM: NotificationUrgency.MEDIUM,
-                    InsightSeverity.LOW: NotificationUrgency.LOW
-                }
-                
-                urgency = urgency_mapping.get(insight.severity, NotificationUrgency.MEDIUM)
-                
-                notification_data = {
-                    "notification_id": insight.insight_id,
-                    "insight_type": insight.insight_type.value,
-                    "severity": insight.severity.value,
-                    "title": insight.title,
-                    "message": insight.message,
-                    "urgency": urgency.value,
-                    "priority_score": insight.relevance_score,
-                    "confidence_score": insight.confidence_score,
-                    "original_timing": insight.optimal_timing.isoformat(),
-                    "data_points": insight.data_points
-                }
-                notifications_data.append(notification_data)
-            
-            # Use batch optimization for better distribution
-            user_id = insights[0].user_id
-            optimized_schedules = await self.timing_optimization_tool.batch_optimize_notifications(
-                user_id=user_id,
-                notifications=notifications_data
-            )
-            
-            # Apply optimized timing back to insights
-            schedule_map = {schedule.notification_id: schedule for schedule in optimized_schedules}
-            
-            for insight in insights:
-                schedule = schedule_map.get(insight.insight_id)
-                if schedule:
-                    # Update insight timing with optimized schedule
-                    insight.optimal_timing = schedule.optimized_time
-                    
-                    # Set expiration based on urgency and delay
-                    delay_hours = (schedule.optimized_time - schedule.original_time).total_seconds() / 3600
-                    
-                    if schedule.urgency == NotificationUrgency.IMMEDIATE:
-                        insight.expires_at = schedule.optimized_time + timedelta(hours=24)
-                    elif schedule.urgency == NotificationUrgency.HIGH:
-                        insight.expires_at = schedule.optimized_time + timedelta(hours=48)
-                    elif insight.insight_type == InsightType.BUDGET_ALERT:
-                        insight.expires_at = schedule.optimized_time + timedelta(days=7)
-                    elif insight.insight_type == InsightType.CELEBRATION:
-                        insight.expires_at = schedule.optimized_time + timedelta(days=3)
-                    else:
-                        insight.expires_at = schedule.optimized_time + timedelta(days=14)
-                    
-                    # Add timing metadata
-                    if not insight.metadata:
-                        insight.metadata = {}
-                    
-                    insight.metadata.update({
-                        "timing_optimization": {
-                            "original_time": schedule.original_time.isoformat(),
-                            "optimized_time": schedule.optimized_time.isoformat(),
-                            "delay_reason": schedule.delay_reason,
-                            "timing_confidence": schedule.confidence_score,
-                            "urgency": schedule.urgency.value,
-                            "reschedule_count": schedule.reschedule_count
-                        }
-                    })
-            
-            # Sort insights by optimized timing for delivery order
-            insights.sort(key=lambda x: x.optimal_timing)
-            
-            self.logger.info(f"Successfully optimized timing for {len(insights)} insights")
-            return insights
-            
-        except Exception as e:
-            self.logger.error(f"Error optimizing insight timing with TimingOptimizationTool: {str(e)}")
-    
-    async def _generate_predictions_from_insights(self, insights: List[ProactiveInsight], prediction_context: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate predictions based on the insights."""
-        try:
-            predictions = {
-                "budget_projections": {},
-                "spending_forecasts": {},
-                "goal_timelines": {},
-                "risk_assessments": {}
-            }
-            
-            for insight in insights:
-                if insight.insight_type == InsightType.BUDGET_ALERT:
-                    category = insight.data_points.get('category')
-                    usage_percentage = insight.data_points.get('usage_percentage', 0)
-                    
-                    if usage_percentage > 90:
-                        predictions["risk_assessments"][category] = {
-                            "risk_level": "high",
-                            "likelihood_of_overspend": 0.8,
-                            "recommendation": "immediate_action_required"
-                        }
-                
-                elif insight.insight_type == InsightType.TREND_WARNING:
-                    category = insight.data_points.get('category')
-                    projected_increase = insight.data_points.get('projected_increase', 0)
-                    
-                    predictions["spending_forecasts"][category] = {
-                        "trend": "increasing",
-                        "projected_monthly_increase": projected_increase,
-                        "confidence": insight.confidence_score
-                    }
-            
-            return predictions
-            
-        except Exception as e:
-            self.logger.error(f"Error generating predictions: {str(e)}")
-            return {}
-    
     async def _store_insights(self, insights: List[ProactiveInsight]):
         """Store insights in the database for tracking and history."""
         try:
@@ -1189,3 +885,376 @@ class ProactiveInsightsAgent:
                 "error": str(e),
                 "last_updated": datetime.now().isoformat()
             }
+    # Fix 1: Update _optimize_insight_timing method to handle None return from timing tool
+    async def _optimize_insight_timing(self, insights: List[ProactiveInsight], user_profile: Dict[str, Any]) -> List[ProactiveInsight]:
+        """Optimize timing for insight delivery using the TimingOptimizationTool."""
+        try:
+            if not insights:
+                return insights
+            
+            self.logger.info(f"Optimizing timing for {len(insights)} insights")
+            
+            # Prepare notifications data for batch optimization
+            notifications_data = []
+            for insight in insights:
+                # Map insight severity to notification urgency
+                urgency_mapping = {
+                    InsightSeverity.CRITICAL: NotificationUrgency.IMMEDIATE,
+                    InsightSeverity.HIGH: NotificationUrgency.HIGH,
+                    InsightSeverity.MEDIUM: NotificationUrgency.MEDIUM,
+                    InsightSeverity.LOW: NotificationUrgency.LOW
+                }
+                
+                urgency = urgency_mapping.get(insight.severity, NotificationUrgency.MEDIUM)
+                
+                notification_data = {
+                    "notification_id": insight.insight_id,
+                    "insight_type": insight.insight_type.value,
+                    "severity": insight.severity.value,
+                    "title": insight.title,
+                    "message": insight.message,
+                    "urgency": urgency.value,
+                    "priority_score": insight.relevance_score,
+                    "confidence_score": insight.confidence_score,
+                    "original_timing": insight.optimal_timing.isoformat(),
+                    "data_points": insight.data_points
+                }
+                notifications_data.append(notification_data)
+            
+            # Use batch optimization for better distribution
+            user_id = insights[0].user_id
+            optimized_schedules = await self.timing_optimization_tool.batch_optimize_notifications(
+                user_id=user_id,
+                notifications=notifications_data
+            )
+            
+            # Handle None return from timing tool
+            if optimized_schedules is None:
+                self.logger.warning("Timing optimization tool returned None, using original timing")
+                return insights
+            
+            # Apply optimized timing back to insights
+            schedule_map = {schedule.notification_id: schedule for schedule in optimized_schedules}
+            
+            for insight in insights:
+                schedule = schedule_map.get(insight.insight_id)
+                if schedule:
+                    # Update insight timing with optimized schedule
+                    insight.optimal_timing = schedule.optimized_time
+                    
+                    # Set expiration based on urgency and delay
+                    if schedule.urgency == NotificationUrgency.IMMEDIATE:
+                        insight.expires_at = schedule.optimized_time + timedelta(hours=24)
+                    elif schedule.urgency == NotificationUrgency.HIGH:
+                        insight.expires_at = schedule.optimized_time + timedelta(hours=48)
+                    elif insight.insight_type == InsightType.BUDGET_ALERT:
+                        insight.expires_at = schedule.optimized_time + timedelta(days=7)
+                    elif insight.insight_type == InsightType.CELEBRATION:
+                        insight.expires_at = schedule.optimized_time + timedelta(days=3)
+                    else:
+                        insight.expires_at = schedule.optimized_time + timedelta(days=14)
+                    
+                    # Add timing metadata
+                    if not insight.metadata:
+                        insight.metadata = {}
+                    
+                    insight.metadata.update({
+                        "timing_optimization": {
+                            "original_time": schedule.original_time.isoformat(),
+                            "optimized_time": schedule.optimized_time.isoformat(),
+                            "delay_reason": schedule.delay_reason,
+                            "timing_confidence": schedule.confidence_score,
+                            "urgency": schedule.urgency.value,
+                            "reschedule_count": schedule.reschedule_count
+                        }
+                    })
+            
+            # Sort insights by optimized timing for delivery order
+            insights.sort(key=lambda x: x.optimal_timing)
+            
+            self.logger.info(f"Successfully optimized timing for {len(insights)} insights")
+            return insights
+            
+        except Exception as e:
+            self.logger.error(f"Error optimizing insight timing with TimingOptimizationTool: {str(e)}")
+            # Return original insights if timing optimization fails
+            return insights
+
+    # Fix 2: Update _generate_notifications_from_insights to handle None returns
+    async def _generate_notifications_from_insights(self, insights: List[ProactiveInsight]) -> List[Dict[str, Any]]:
+        """Generate notifications from proactive insights using the notification generation tool."""
+        notifications = []
+        
+        try:
+            if not insights:
+                return notifications
+                
+            # Map insight types to notification types
+            insight_to_notification_mapping = {
+                InsightType.BUDGET_ALERT: NotifType.BUDGET_ALERT,
+                InsightType.SPENDING_ANOMALY: NotifType.SPENDING_INSIGHT,
+                InsightType.TREND_WARNING: NotifType.SPENDING_INSIGHT,
+                InsightType.GOAL_UPDATE: NotifType.GOAL_UPDATE,
+                InsightType.OPPORTUNITY: NotifType.RECOMMENDATION,
+                InsightType.SEASONAL_REMINDER: NotifType.SEASONAL_REMINDER,
+                InsightType.CELEBRATION: NotifType.CELEBRATION
+            }
+            
+            # Prepare notification generation requests
+            notification_requests = []
+            for insight in insights:
+                notification_type = insight_to_notification_mapping.get(
+                    insight.insight_type, 
+                    NotifType.SPENDING_INSIGHT
+                )
+                
+                # Determine template based on insight specifics
+                template_id = self._select_template_id(insight)
+                
+                notification_request = {
+                    'user_id': insight.user_id,
+                    'notification_type': notification_type.value,
+                    'template_id': template_id,
+                    'insight_data': {
+                        'insight_id': insight.insight_id,
+                        'insight_type': insight.insight_type.value,
+                        'severity': insight.severity.value,
+                        'title': insight.title,
+                        'message': insight.message,
+                        'data_points': insight.data_points,
+                        'recommendations': insight.recommendations,
+                        'confidence_score': insight.confidence_score,
+                        'relevance_score': insight.relevance_score
+                    },
+                    'custom_data': {
+                        'optimal_timing': insight.optimal_timing.isoformat(),
+                        'expires_at': insight.expires_at.isoformat() if insight.expires_at else None,
+                        'metadata': insight.metadata or {}
+                    }
+                }
+                notification_requests.append(notification_request)
+            
+            # Generate notifications in batch for efficiency
+            if notification_requests:
+                generated_notifications = await self.notification_generation_tool.generate_batch_notifications(
+                    notification_requests
+                )
+                
+                # Handle None return from notification tool
+                if generated_notifications is None:
+                    self.logger.warning("Notification generation tool returned None")
+                    return notifications
+                
+                # Convert to dict format for return
+                for notif in generated_notifications:
+                    notifications.append({
+                        'notification_id': notif.notification_id,
+                        'user_id': notif.user_id,
+                        'notification_type': notif.notification_type.value,
+                        'title': notif.title,
+                        'message': notif.message,
+                        'rich_content': notif.rich_content,
+                        'priority': notif.priority.value,
+                        'channels': [ch.value for ch in notif.channels],
+                        'action_buttons': notif.action_buttons,
+                        'data_visualization': notif.data_visualization,
+                        'quick_actions': notif.quick_actions,
+                        'expires_at': notif.expires_at.isoformat() if notif.expires_at else None,
+                        'metadata': notif.metadata
+                    })
+                
+                self.logger.info(f"Generated {len(notifications)} notifications from {len(insights)} insights")
+            
+        except Exception as e:
+            self.logger.error(f"Error generating notifications from insights: {str(e)}")
+            # Continue without notifications - insights are still valuable
+        
+        return notifications
+
+    # Fix 3: Update _generate_predictions_from_insights to handle None insights
+    async def _generate_predictions_from_insights(self, insights: List[ProactiveInsight], prediction_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate predictions based on the insights."""
+        try:
+            predictions = {
+                "budget_projections": {},
+                "spending_forecasts": {},
+                "goal_timelines": {},
+                "risk_assessments": {}
+            }
+            
+            if not insights:
+                return predictions
+            
+            for insight in insights:
+                if insight.insight_type == InsightType.BUDGET_ALERT:
+                    category = insight.data_points.get('category')
+                    usage_percentage = insight.data_points.get('usage_percentage', 0)
+                    
+                    if usage_percentage > 90:
+                        predictions["risk_assessments"][category] = {
+                            "risk_level": "high",
+                            "likelihood_of_overspend": 0.8,
+                            "recommendation": "immediate_action_required"
+                        }
+                
+                elif insight.insight_type == InsightType.TREND_WARNING:
+                    category = insight.data_points.get('category')
+                    projected_increase = insight.data_points.get('projected_increase', 0)
+                    
+                    predictions["spending_forecasts"][category] = {
+                        "trend": "increasing",
+                        "projected_monthly_increase": projected_increase,
+                        "confidence": insight.confidence_score
+                    }
+            
+            return predictions
+            
+        except Exception as e:
+            self.logger.error(f"Error generating predictions: {str(e)}")
+            return {
+                "budget_projections": {},
+                "spending_forecasts": {},
+                "goal_timelines": {},
+                "risk_assessments": {}
+            }
+
+    # Fix 4: Update _predict_spending_trends to handle string returns
+    async def _predict_spending_trends(self, user_id: str, historical_analysis: Dict[str, Any], prediction_context: Dict[str, Any]) -> List[ProactiveInsight]:
+        """Predict future spending trends using the TrendPredictionTool."""
+        insights = []
+        
+        try:
+            # Extract parameters from context
+            categories = prediction_context.get('categories', None)
+            prediction_types = prediction_context.get('prediction_types', None)
+            horizon_days = prediction_context.get('horizon_days', 90)
+            
+            # Get trend predictions from the tool
+            trend_predictions = await self.trend_prediction_tool.predict_trends(
+                user_id=user_id,
+                categories=categories,
+                prediction_types=prediction_types,
+                horizon_days=horizon_days
+            )
+            
+            # Handle case where tool returns error string instead of predictions
+            if isinstance(trend_predictions, str):
+                self.logger.warning(f"TrendPredictionTool returned error string: {trend_predictions}")
+                return insights
+            
+            if not trend_predictions:
+                self.logger.info("No trend predictions returned from TrendPredictionTool")
+                return insights
+            
+            # Convert trend predictions to proactive insights
+            for prediction in trend_predictions:
+                # Handle case where prediction might be a dict instead of object
+                if isinstance(prediction, dict):
+                    # Convert dict to object-like access
+                    class PredictionObj:
+                        def __init__(self, data):
+                            for key, value in data.items():
+                                setattr(self, key, value)
+                    
+                    prediction = PredictionObj(prediction)
+                
+                # Map severity levels
+                severity_mapping = {
+                    TrendToolSeverity.CRITICAL: InsightSeverity.CRITICAL,
+                    TrendToolSeverity.HIGH: InsightSeverity.HIGH,
+                    TrendToolSeverity.MEDIUM: InsightSeverity.MEDIUM,
+                    TrendToolSeverity.LOW: InsightSeverity.LOW
+                }
+                
+                # Map trend types to insight types
+                insight_type_mapping = {
+                    TrendType.SPENDING_INCREASE: InsightType.TREND_WARNING,
+                    TrendType.SPENDING_DECREASE: InsightType.OPPORTUNITY,
+                    TrendType.SEASONAL_PATTERN: InsightType.SEASONAL_REMINDER,
+                    TrendType.BUDGET_CHALLENGE: InsightType.BUDGET_ALERT,
+                    TrendType.EMERGING_CATEGORY: InsightType.OPPORTUNITY,
+                    TrendType.BEHAVIOR_SHIFT: InsightType.TREND_WARNING,
+                    TrendType.MERCHANT_LOYALTY: InsightType.OPPORTUNITY,
+                    TrendType.PAYMENT_METHOD_SHIFT: InsightType.OPPORTUNITY
+                }
+                
+                # Generate recommendations from prediction actions
+                recommendations = []
+                
+                # Safely get attributes with defaults
+                preparation_actions = getattr(prediction, 'preparation_actions', [])
+                mitigation_strategies = getattr(prediction, 'mitigation_strategies', [])
+                opportunities = getattr(prediction, 'opportunities', [])
+                
+                # Add preparation actions
+                for action in preparation_actions:
+                    recommendations.append({
+                        "type": "preparation",
+                        "action": action.get("action", "") if isinstance(action, dict) else str(action),
+                        "description": action.get("description", "") if isinstance(action, dict) else "",
+                        "priority": action.get("priority", "medium") if isinstance(action, dict) else "medium",
+                        "estimated_impact": action.get("estimated_impact", "") if isinstance(action, dict) else ""
+                    })
+                
+                # Add mitigation strategies
+                for strategy in mitigation_strategies:
+                    recommendations.append({
+                        "type": "mitigation",
+                        "strategy": strategy.get("strategy", "") if isinstance(strategy, dict) else str(strategy),
+                        "description": strategy.get("description", "") if isinstance(strategy, dict) else "",
+                        "effort": strategy.get("effort", "medium") if isinstance(strategy, dict) else "medium",
+                        "potential_savings": strategy.get("potential_savings", "") if isinstance(strategy, dict) else ""
+                    })
+                
+                # Add opportunities
+                for opportunity in opportunities:
+                    recommendations.append({
+                        "type": "opportunity",
+                        "opportunity": opportunity.get("opportunity", "") if isinstance(opportunity, dict) else str(opportunity),
+                        "description": opportunity.get("description", "") if isinstance(opportunity, dict) else "",
+                        "potential_benefit": opportunity.get("potential_benefit", "") if isinstance(opportunity, dict) else "",
+                        "action_required": opportunity.get("action_required", "") if isinstance(opportunity, dict) else ""
+                    })
+                
+                # Safely get required attributes
+                trend_type = getattr(prediction, 'trend_type', TrendType.SPENDING_INCREASE)
+                severity = getattr(prediction, 'severity', TrendToolSeverity.MEDIUM)
+                title = getattr(prediction, 'title', 'Trend Analysis')
+                description = getattr(prediction, 'description', 'Spending trend detected')
+                category = getattr(prediction, 'category', 'general')
+                confidence_score = getattr(prediction, 'confidence_score', 0.7)
+                
+                insight = ProactiveInsight(
+                    insight_id=str(uuid.uuid4()),
+                    user_id=user_id,
+                    insight_type=insight_type_mapping.get(trend_type, InsightType.TREND_WARNING),
+                    severity=severity_mapping.get(severity, InsightSeverity.MEDIUM),
+                    title=title,
+                    message=description,
+                    data_points={
+                        "category": category,
+                        "trend_type": trend_type.value if hasattr(trend_type, 'value') else str(trend_type),
+                        "predicted_impact": getattr(prediction, 'predicted_impact', {}),
+                        "timeline": getattr(prediction, 'timeline', {}),
+                        "confidence_score": confidence_score,
+                        "statistical_evidence": getattr(prediction, 'statistical_evidence', {}),
+                        "model_metrics": getattr(prediction, 'model_metrics', {})
+                    },
+                    recommendations=recommendations,
+                    confidence_score=confidence_score,
+                    relevance_score=self._calculate_relevance_score(prediction),
+                    optimal_timing=datetime.now(),
+                    expires_at=getattr(prediction, 'valid_until', None),
+                    metadata={
+                        "prediction_id": getattr(prediction, 'prediction_id', str(uuid.uuid4())),
+                        "model_used": getattr(prediction, 'model_used', 'unknown'),
+                        "data_quality_score": getattr(prediction, 'data_quality_score', 0.8),
+                        "historical_data": getattr(prediction, 'historical_data', {})
+                    }
+                )
+                insights.append(insight)
+            
+        except Exception as e:
+            self.logger.error(f"Error predicting spending trends with TrendPredictionTool: {str(e)}")
+        
+        return insights

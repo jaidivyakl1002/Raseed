@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from enum import Enum
 import uuid
+import asyncpg
 from scipy import stats
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LinearRegression, Ridge
@@ -15,8 +16,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import warnings
 warnings.filterwarnings('ignore')
-
-from core.base_agent_tools.database_connector import DatabaseConnector
+from google.cloud import secretmanager
 from core.base_agent_tools.config_manager import AgentConfig
 from core.base_agent_tools.error_handler import ErrorHandler
 
@@ -106,35 +106,76 @@ class TrendPredictionTool:
     
     def __init__(
         self,
-        db_connector: Optional[DatabaseConnector] = None,
-        config: Optional[AgentConfig] = None
+        project_id: str,
+        logger: Optional[logging.Logger] = None
     ):
-        # Initialize configuration
-        self.config = config or AgentConfig.from_env()
-        self.db_connector = db_connector or DatabaseConnector()
-        
-        # Set up logging
-        self.logger = self._setup_logging()
-        
-        # Error handling
-        self.error_handler = ErrorHandler(self.logger)
-        
-        # Model parameters
-        self.min_data_points = 30  # Minimum transactions needed for predictions
-        self.seasonal_lookback_months = 24  # Look back 2 years for seasonal patterns
-        self.trend_lookback_months = 6     # Look back 6 months for trend analysis
-        self.prediction_horizon_days = 90  # Predict 3 months ahead
-        
-        # Statistical thresholds
+        self.logger = logger or logging.getLogger(__name__)
+        self.project_id = project_id
+        self.connection_pool = None  # Add this line
+        self.secret_client = secretmanager.SecretManagerServiceClient()
+
+        # Add these missing configuration attributes
+        self.prediction_horizon_days = 90
+        self.seasonal_lookback_months = 12
+        self.min_data_points = 30
         self.significance_threshold = 0.05
-        self.trend_strength_threshold = 0.3
-        self.seasonal_strength_threshold = 0.4
-        
-        # Model cache
-        self.model_cache = {}
-        self.pattern_cache = {}
-        
-        self.logger.info("Trend Prediction Tool initialized")
+        self.trend_strength_threshold = 0.4
+        self.seasonal_strength_threshold = 0.6
+
+        # Get database configuration from secrets
+        secret_name = f"projects/{self.project_id}/secrets/postgres-config/versions/latest"
+        response = self.secret_client.access_secret_version(request={"name": secret_name})
+        secret_data = json.loads(response.payload.data.decode("UTF-8"))
+
+        self.db_config = {
+            'host': secret_data["host"],
+            'port': secret_data.get("port", 5432),
+            'database': secret_data["database"],
+            'user': secret_data["user"],
+            'password': secret_data["password"],
+            'min_size': 5,
+            'max_size': 20,
+            'command_timeout': 60
+        }
+    
+    async def initialize_connection_pool(self):
+        """Initialize the database connection pool."""
+        try:
+            if not self.connection_pool:
+                self.connection_pool = await asyncpg.create_pool(**self.db_config)
+                self.logger.info("PostgreSQL connection pool initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize connection pool: {e}")
+            raise
+
+    async def close_connection_pool(self):
+        """Close the database connection pool."""
+        if self.connection_pool:
+            await self.connection_pool.close()
+            self.connection_pool = None
+            self.logger.info("PostgreSQL connection pool closed")
+    
+    async def execute_query(self, query: str, params: List[Any] = None) -> Dict[str, Any]:
+        try:
+            await self.initialize_connection_pool()
+            
+            async with self.connection_pool.acquire() as conn:
+                rows = await conn.fetch(query, *(params or []))
+                
+                return {
+                    "success": True,
+                    "data": [dict(row) for row in rows],
+                    "count": len(rows)
+                }
+                    
+        except Exception as e:
+            self.logger.error(f"Query execution failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "data": [],  # Add this
+                "count": 0   # Add this
+            }
     
     def _setup_logging(self) -> logging.Logger:
         """Set up structured logging."""
@@ -173,14 +214,14 @@ class TrendPredictionTool:
         try:
             self.logger.info(f"Generating trend predictions for user {user_id}")
             
-            horizon_days = horizon_days or self.prediction_horizon_days
+            horizon_days = horizon_days or getattr(self, 'prediction_horizon_days', 90)
             
             # Get historical transaction data
             historical_data = await self._get_historical_data(user_id, categories)
             
             if not self._validate_data_quality(historical_data):
                 self.logger.warning(f"Insufficient data quality for user {user_id}")
-                return []
+                return []  # Return empty list instead of string
             
             predictions = []
             
@@ -188,55 +229,63 @@ class TrendPredictionTool:
             prediction_types = prediction_types or list(TrendType)
             
             for trend_type in prediction_types:
-                if trend_type == TrendType.SPENDING_INCREASE:
-                    predictions.extend(await self._predict_spending_increases(
-                        user_id, historical_data, horizon_days
-                    ))
-                elif trend_type == TrendType.SPENDING_DECREASE:
-                    predictions.extend(await self._predict_spending_decreases(
-                        user_id, historical_data, horizon_days
-                    ))
-                elif trend_type == TrendType.SEASONAL_PATTERN:
-                    predictions.extend(await self._predict_seasonal_changes(
-                        user_id, historical_data, horizon_days
-                    ))
-                elif trend_type == TrendType.BUDGET_CHALLENGE:
-                    predictions.extend(await self._predict_budget_challenges(
-                        user_id, historical_data, horizon_days
-                    ))
-                elif trend_type == TrendType.EMERGING_CATEGORY:
-                    predictions.extend(await self._predict_emerging_categories(
-                        user_id, historical_data, horizon_days
-                    ))
-                elif trend_type == TrendType.BEHAVIOR_SHIFT:
-                    predictions.extend(await self._predict_behavior_shifts(
-                        user_id, historical_data, horizon_days
-                    ))
-                elif trend_type == TrendType.MERCHANT_LOYALTY:
-                    predictions.extend(await self._predict_merchant_changes(
-                        user_id, historical_data, horizon_days
-                    ))
-                elif trend_type == TrendType.PAYMENT_METHOD_SHIFT:
-                    predictions.extend(await self._predict_payment_method_shifts(
-                        user_id, historical_data, horizon_days
-                    ))
+                try:  # Add individual try-catch for each prediction type
+                    if trend_type == TrendType.SPENDING_INCREASE:
+                        predictions.extend(await self._predict_spending_increases(
+                            user_id, historical_data, horizon_days
+                        ))
+                    elif trend_type == TrendType.SPENDING_DECREASE:
+                        predictions.extend(await self._predict_spending_decreases(
+                            user_id, historical_data, horizon_days
+                        ))
+                    elif trend_type == TrendType.SEASONAL_PATTERN:
+                        predictions.extend(await self._predict_seasonal_changes(
+                            user_id, historical_data, horizon_days
+                        ))
+                    elif trend_type == TrendType.BUDGET_CHALLENGE:
+                        predictions.extend(await self._predict_budget_challenges(
+                            user_id, historical_data, horizon_days
+                        ))
+                    elif trend_type == TrendType.EMERGING_CATEGORY:
+                        predictions.extend(await self._predict_emerging_categories(
+                            user_id, historical_data, horizon_days
+                        ))
+                    elif trend_type == TrendType.BEHAVIOR_SHIFT:
+                        predictions.extend(await self._predict_behavior_shifts(
+                            user_id, historical_data, horizon_days
+                        ))
+                    elif trend_type == TrendType.MERCHANT_LOYALTY:
+                        predictions.extend(await self._predict_merchant_changes(
+                            user_id, historical_data, horizon_days
+                        ))
+                    elif trend_type == TrendType.PAYMENT_METHOD_SHIFT:
+                        predictions.extend(await self._predict_payment_method_shifts(
+                            user_id, historical_data, horizon_days
+                        ))
+                except Exception as e:
+                    self.logger.error(f"Error generating {trend_type.value} prediction: {str(e)}")
+                    continue  # Skip this prediction type but continue with others
             
             # Filter and prioritize predictions
-            filtered_predictions = await self._filter_and_rank_predictions(predictions)
+            try:
+                filtered_predictions = await self._filter_and_rank_predictions(predictions)
+            except Exception as e:
+                self.logger.error(f"Error filtering predictions: {str(e)}")
+                filtered_predictions = predictions  # Use unfiltered if filtering fails
             
             # Store predictions for future reference
-            await self._store_predictions(filtered_predictions)
+            try:
+                await self._store_predictions(filtered_predictions)
+            except Exception as e:
+                self.logger.warning(f"Failed to store predictions: {str(e)}")
+                # Continue even if storage fails
             
             self.logger.info(f"Generated {len(filtered_predictions)} trend predictions for user {user_id}")
             return filtered_predictions
             
         except Exception as e:
             self.logger.error(f"Error generating trend predictions: {str(e)}")
-            return await self.error_handler.handle_error(e, {
-                "operation": "predict_trends",
-                "user_id": user_id,
-                "categories": categories
-            })
+            return []
     
     async def _get_historical_data(self, user_id: str, categories: Optional[List[str]] = None) -> Dict[str, Any]:
         """Get historical transaction data for analysis."""
@@ -279,7 +328,7 @@ class TrendPredictionTool:
             query += " ORDER BY t.transaction_date"
             
             # Execute query
-            result = await self.db_connector.execute_query(query, params)
+            result = await self.execute_query(query, params)
             transactions = result.get('data', [])
             
             if not transactions:
@@ -298,7 +347,7 @@ class TrendPredictionTool:
                     AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
                     AND effective_from <= CURRENT_DATE
             """
-            budget_result = await self.db_connector.execute_query(budget_query, [user_id])
+            budget_result = await self.execute_query(budget_query, [user_id])
             budget_limits = {row['category']: row['limit_amount'] for row in budget_result.get('data', [])}
             
             # Get user financial goals
@@ -308,7 +357,7 @@ class TrendPredictionTool:
                 FROM financial_goals 
                 WHERE user_id = %s AND status = 'active'
             """
-            goals_result = await self.db_connector.execute_query(goals_query, [user_id])
+            goals_result = await self.execute_query(goals_query, [user_id])
             financial_goals = goals_result.get('data', [])
             
             return {
@@ -1643,7 +1692,7 @@ class TrendPredictionTool:
                     updated_at = CURRENT_TIMESTAMP
             """
             
-            await self.db_connector.execute_batch_insert(insert_query, insert_data)
+            await self.execute_query(insert_query, insert_data)
             self.logger.info(f"Stored {len(predictions)} trend predictions")
             
         except Exception as e:
@@ -2441,7 +2490,7 @@ class TrendPredictionTool:
                 ORDER BY prediction_date DESC
             """
             
-            result = await self.db_connector.execute_query(query, [user_id, cutoff_date])
+            result = await self.execute_query(query, [user_id, cutoff_date])
             predictions = result.get('data', [])
             
             # Categorize predictions
@@ -2531,7 +2580,7 @@ class TrendPredictionTool:
                 RETURNING prediction_id
             """
             
-            result = await self.db_connector.execute_query(query, [])
+            result = await self.execute_query(query, [])
             invalidated_count = len(result.get('data', []))
             
             if invalidated_count > 0:
@@ -2573,7 +2622,7 @@ class TrendPredictionTool:
                 ORDER BY trend_type, avg_confidence DESC
             """
             
-            result = await self.db_connector.execute_query(query, [cutoff_date])
+            result = await self.execute_query(query, [cutoff_date])
             performance_data = result.get('data', [])
             
             metrics = {
@@ -2640,19 +2689,3 @@ class TrendPredictionTool:
         except Exception as e:
             self.logger.error(f"Error analyzing prediction performance: {str(e)}")
             return {'error': str(e)}
-
-    async def cleanup_resources(self):
-        """Clean up resources and close connections."""
-        try:
-            # Clear caches
-            self.model_cache.clear()
-            self.pattern_cache.clear()
-            
-            # Close database connection if needed
-            if hasattr(self.db_connector, 'close'):
-                await self.db_connector.close()
-            
-            self.logger.info("Trend Prediction Tool resources cleaned up")
-            
-        except Exception as e:
-            self.logger.error(f"Error during cleanup: {str(e)}")

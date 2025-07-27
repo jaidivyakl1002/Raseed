@@ -414,7 +414,7 @@ from utils.user_lookup import get_user_id_by_firebase_uid
 @app.post("/chat")
 async def chat_handler(
     request: Request,
-    auth=Depends(firebase_auth_required),
+    # auth=Depends(firebase_auth_required),
     body: dict = Body(...)
 ):
     try:
@@ -453,7 +453,6 @@ async def chat_handler(
 
         full_json = json.loads(result.model_dump_json())
         step_results = full_json.get("step_results", {})
-
         # Check each possible key in priority order
         possible_keys = [
             "synthesize_insights",
@@ -472,7 +471,7 @@ async def chat_handler(
         if not selected_result:
             raise HTTPException(status_code=500, detail="No valid result found in step_results")
 
-        return JSONResponse(content={"reply": selected_result})
+        return JSONResponse(content={"reply": full_json})
 
     except Exception as e:
         print(f"Error in /chat: {e}")

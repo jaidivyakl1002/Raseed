@@ -5,13 +5,16 @@ from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta, time
 from dataclasses import dataclass
 from enum import Enum
+import asyncpg
+import json
+from google.cloud import secretmanager
+from typing import List, Any, Optional
 import uuid
 import statistics
 from collections import defaultdict, Counter
 
 import pytz
 from vertexai.generative_models import GenerativeModel, Tool, FunctionDeclaration
-from core.base_agent_tools.database_connector import DatabaseConnector
 from core.base_agent_tools.config_manager import AgentConfig
 from core.base_agent_tools.vertex_initializer import VertexAIInitializer
 from core.base_agent_tools.integration_coordinator import IntegrationCoordinator
@@ -83,44 +86,72 @@ class TimingOptimizationTool:
     This tool analyzes user behavior, engagement patterns, and preferences to determine
     the optimal timing for delivering proactive insights and notifications.
     """
-    
-    def __init__(
-        self,
-        project_id: Optional[str] = None,
-        location: Optional[str] = None,
-        model_name: Optional[str] = None
-    ):
-        # Initialize configuration
-        self.system_config = AgentConfig.from_env()
+
+    def __init__(self, project_id: Optional[str] = None, logger: Optional[logging.Logger] = None):
+        
+        # Add database configuration similar to PostgreSQL tool
         self.project_id = project_id or self.system_config.project_id
-        self.location = location or self.system_config.location
-        self.model_name = model_name or self.system_config.model_name
+        self.secret_client = secretmanager.SecretManagerServiceClient()
+        self.connection_pool: Optional[asyncpg.Pool] = None
         
-        # Set up logging
-        self.logger = self._setup_logging()
-        
-        # Initialize shared tools
-        self.db_connector = DatabaseConnector()
-        self.integration_coordinator = IntegrationCoordinator()
-        self.error_handler = ErrorHandler(self.logger)
-        
-        # Initialize Vertex AI for ML-based timing predictions
-        VertexAIInitializer.initialize(self.project_id, self.location)
-        self.model = GenerativeModel(model_name=self.model_name)
-        
-        # Timing optimization state
-        self.user_timing_profiles = {}  # Cache for user timing profiles
-        self.notification_queue = {}    # Per-user notification queues
-        self.engagement_history = {}    # Track notification engagement
-        
-        # Default timing windows (will be personalized per user)
-        self.default_optimal_windows = [
-            OptimalTimeWindow(time(9, 0), time(10, 30), "UTC", 0.7, priority_level=1),   # Morning
-            OptimalTimeWindow(time(13, 0), time(14, 0), "UTC", 0.6, priority_level=2),   # Lunch
-            OptimalTimeWindow(time(18, 0), time(20, 0), "UTC", 0.8, priority_level=1),   # Evening
-        ]
-        
-        self.logger.info("Timing Optimization Tool initialized")
+        # Get database config from secrets
+        secret_name = f"projects/{self.project_id}/secrets/postgres-config/versions/latest"
+        response = self.secret_client.access_secret_version(request={"name": secret_name})
+        secret_data = json.loads(response.payload.data.decode("UTF-8"))
+
+        self.db_config = {
+            'host': secret_data["host"],
+            'port': secret_data.get("port", 5432),
+            'database': secret_data["database"],
+            'user': secret_data["user"],
+            'password': secret_data["password"],
+            'min_size': 5,
+            'max_size': 20,
+            'command_timeout': 60
+        }
+    
+    async def initialize_connection_pool(self):
+        """Initialize the database connection pool."""
+        try:
+            if not self.connection_pool:
+                self.connection_pool = await asyncpg.create_pool(**self.db_config)
+                self.logger.info("PostgreSQL connection pool initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize connection pool: {e}")
+            raise
+
+    async def close_connection_pool(self):
+        """Close the database connection pool."""
+        if self.connection_pool:
+            await self.connection_pool.close()
+            self.connection_pool = None
+            self.logger.info("PostgreSQL connection pool closed")
+    
+    async def _execute_db_query(self, query: str, params: List[Any] = None) -> List[Dict]:
+        """Execute database query with connection pool."""
+        try:
+            await self.initialize_connection_pool()
+            
+            async with self.connection_pool.acquire() as conn:
+                rows = await conn.fetch(query, *(params or []))
+                return [dict(row) for row in rows]
+                
+        except Exception as e:
+            self.logger.error(f"Database query failed: {e}")
+            return []
+
+    async def _execute_db_query_one(self, query: str, params: List[Any] = None) -> Optional[Dict]:
+        """Execute database query expecting single result."""
+        try:
+            await self.initialize_connection_pool()
+            
+            async with self.connection_pool.acquire() as conn:
+                row = await conn.fetchrow(query, *(params or []))
+                return dict(row) if row else None
+                
+        except Exception as e:
+            self.logger.error(f"Database query failed: {e}")
+            return None
     
     def _setup_logging(self) -> logging.Logger:
         """Set up structured logging for the tool."""
@@ -532,7 +563,7 @@ class TimingOptimizationTool:
             """
             
             thirty_days_ago = datetime.now() - timedelta(days=30)
-            results = await self.db_connector.fetch_all(query, [user_id, thirty_days_ago])
+            results = await self._execute_db_query(query, [user_id, thirty_days_ago])
             
             if not results:
                 return {"total_notifications": 0, "engagement_rate": 0.0}
@@ -594,7 +625,7 @@ class TimingOptimizationTool:
             """
             
             thirty_days_ago = datetime.now() - timedelta(days=30)
-            chat_results = await self.db_connector.fetch_all(pg_query, [user_id, thirty_days_ago])
+            chat_results = await self._execute_db_query(pg_query, [user_id, thirty_days_ago])
             
             if not chat_results:
                 return {"activity_level": "low", "peak_hours": []}
@@ -798,7 +829,7 @@ class TimingOptimizationTool:
             WHERE user_id = %s AND is_active = true
             """
             
-            result = await self.db_connector.fetch_one(query, [user_id])
+            result = await self._execute_db_query_one(query, [user_id])
             
             if not result:
                 # Create default user entry if doesn't exist
@@ -1269,7 +1300,7 @@ class TimingOptimizationTool:
             ORDER BY sent_at DESC
             """
             
-            db_results = await self.db_connector.fetch_all(query, [user_id, cutoff_time])
+            db_results = await self._execute_db_query(query, [user_id, cutoff_time])
             db_times = [r['sent_at'] for r in db_results]
             
             # Combine and deduplicate

@@ -15,7 +15,7 @@ class InsightSynthesisAgent(BaseAgent):
             location = "us-central1",
             model_name=model
         )
-
+        self.last_tool_outputs = {}
         # Pass the shared model from BaseAgent to all tools
         self.insight_tool = InsightSummaryTool(model=self.model)
         self.visualisation_tool = VisualisationTool(model=self.model)
@@ -87,9 +87,10 @@ class InsightSynthesisAgent(BaseAgent):
         original_query = request.get("original_query", "")
         user_id = request.get("user_id", "")
         recommendations = request.get("recommendations")
+        predictions = request.get("predictions")
 
         # Step 1: Generate insight summary
-        insight_summary = self.insight_tool.run(analysis_results, original_query, user_id, recommendations)
+        insight_summary = self.insight_tool.run(analysis_results, original_query, user_id, recommendations, predictions)
 
         # Step 2: Suggest chart type and values
         visualisation = self.visualisation_tool.run(analysis_results, original_query, user_id)

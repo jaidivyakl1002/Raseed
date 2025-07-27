@@ -10,7 +10,6 @@ import asyncpg
 from pathlib import Path
 
 # Import your existing modules
-from core.base_agent_tools.database_connector import DatabaseConnector
 from core.base_agent_tools.config_manager import AgentConfig
 from core.base_agent_tools.vertex_initializer import VertexAIInitializer
 from vertexai.generative_models import GenerativeModel
@@ -102,44 +101,51 @@ class UserPersonalizationData:
     financial_literacy_level: str  # beginner, intermediate, advanced
 
 
+from google.cloud import secretmanager
+
 class NotificationGenerationTool:
-    """
-    Tool for generating personalized, engaging notifications for financial insights.
-    """
-    
     def __init__(
         self,
-        db_connection_string: str,
-        project_id: Optional[str] = None,
-        location: Optional[str] = None,
-        model_name: Optional[str] = None
+        project_id: str,
+        logger: Optional[logging.Logger] = None
     ):
-        self.db_connection_string = db_connection_string
-        self.db_connector = DatabaseConnector()
-        self.config = AgentConfig.from_env()
-        
-        # Vertex AI setup
-        self.project_id = project_id or self.config.project_id
-        self.location = location or self.config.location
-        self.model_name = model_name or self.config.model_name
-        
-        VertexAIInitializer.initialize(self.project_id, self.location)
-        self.model = GenerativeModel(model_name=self.model_name)
-        
-        # Set up logging
-        self.logger = self._setup_logging()
-        
-        # Database connection pool
-        self.db_pool = None
-        
-        # Template storage
-        self.templates = {}
-        self._load_notification_templates()
-        
-        # Personalization cache
-        self.personalization_cache = {}
-        
-        self.logger.info("Notification Generation Tool initialized")
+        self.logger = logger or logging.getLogger(__name__)
+        self.project_id = project_id
+        self.connection_pool: Optional[asyncpg.Pool] = None
+        self.secret_client = secretmanager.SecretManagerServiceClient()
+
+        # Get database config from Secret Manager
+        secret_name = f"projects/{self.project_id}/secrets/postgres-config/versions/latest"
+        response = self.secret_client.access_secret_version(request={"name": secret_name})
+        secret_data = json.loads(response.payload.data.decode("UTF-8"))
+
+        self.db_config = {
+            'host': secret_data["host"],
+            'port': secret_data.get("port", 5432),
+            'database': secret_data["database"],
+            'user': secret_data["user"],
+            'password': secret_data["password"],
+            'min_size': 5,
+            'max_size': 20,
+            'command_timeout': 60
+        }
+    
+    async def initialize_connection_pool(self):
+        """Initialize the database connection pool."""
+        try:
+            if not self.connection_pool:
+                self.connection_pool = await asyncpg.create_pool(**self.db_config)
+                self.logger.info("PostgreSQL connection pool initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize connection pool: {e}")
+            raise
+
+    async def close_connection_pool(self):
+        """Close the database connection pool."""
+        if self.connection_pool:
+            await self.connection_pool.close()
+            self.connection_pool = None
+            self.logger.info("PostgreSQL connection pool closed")
 
     def _setup_logging(self) -> logging.Logger:
         """Set up structured logging."""
@@ -159,24 +165,14 @@ class NotificationGenerationTool:
     async def initialize(self):
         """Initialize database connections and load templates."""
         try:
-            # Initialize database pool
-            self.db_pool = await asyncpg.create_pool(
-                self.db_connection_string,
-                min_size=2,
-                max_size=10,
-                command_timeout=30
-            )
+            # Initialize database pool using the same pattern as PostgreSQL tool
+            await self.initialize_connection_pool()
             
             self.logger.info("Notification Generation Tool initialized successfully")
             
         except Exception as e:
             self.logger.error(f"Failed to initialize: {str(e)}")
             raise
-
-    async def close(self):
-        """Close database connections."""
-        if self.db_pool:
-            await self.db_pool.close()
 
     def _load_notification_templates(self):
         """Load notification templates."""
@@ -425,7 +421,7 @@ class NotificationGenerationTool:
                 return cached_data['data']
         
         try:
-            async with self.db_pool.acquire() as conn:
+            async with self.connection_pool.acquire() as conn:
                 # Get user basic info and preferences
                 user_query = """
                     SELECT 
@@ -1125,7 +1121,7 @@ class NotificationGenerationTool:
         """Apply frequency limits to prevent notification spam."""
         
         try:
-            async with self.db_pool.acquire() as conn:
+            async with self.connection_pool.acquire() as conn:
                 # Get today's sent notifications for this user
                 today_notifications = await conn.fetch("""
                     SELECT notification_type, COUNT(*) as count
@@ -1183,7 +1179,7 @@ class NotificationGenerationTool:
     async def _store_notification(self, notification: NotificationContent):
         """Store notification in the database."""
         try:
-            async with self.db_pool.acquire() as conn:
+            async with self.connection_pool.acquire() as conn:
                 await conn.execute("""
                     INSERT INTO notifications (
                         notification_id, user_id, notification_type, title, message,
@@ -1219,7 +1215,7 @@ class NotificationGenerationTool:
             return
             
         try:
-            async with self.db_pool.acquire() as conn:
+            async with self.connection_pool.acquire() as conn:
                 # Prepare batch insert data
                 notification_data = []
                 for notif in notifications:
@@ -1280,7 +1276,7 @@ class NotificationGenerationTool:
     ) -> List[Dict[str, Any]]:
         """Get notification history for a user."""
         try:
-            async with self.db_pool.acquire() as conn:
+            async with self.connection_pool.acquire() as conn:
                 notifications = await conn.fetch("""
                     SELECT 
                         notification_id,
@@ -1307,7 +1303,7 @@ class NotificationGenerationTool:
     async def mark_notification_as_sent(self, notification_id: str):
         """Mark a notification as sent."""
         try:
-            async with self.db_pool.acquire() as conn:
+            async with self.connection_pool.acquire() as conn:
                 await conn.execute("""
                     UPDATE notifications 
                     SET status = 'sent', sent_at = CURRENT_TIMESTAMP
@@ -1320,7 +1316,7 @@ class NotificationGenerationTool:
     async def mark_notification_as_viewed(self, notification_id: str):
         """Mark a notification as viewed by the user."""
         try:
-            async with self.db_pool.acquire() as conn:
+            async with self.connection_pool.acquire() as conn:
                 await conn.execute("""
                     UPDATE notifications 
                     SET status = 'viewed', viewed_at = CURRENT_TIMESTAMP
@@ -1333,7 +1329,7 @@ class NotificationGenerationTool:
     async def get_pending_notifications(self, user_id: str) -> List[Dict[str, Any]]:
         """Get pending notifications for a user."""
         try:
-            async with self.db_pool.acquire() as conn:
+            async with self.connection_pool.acquire() as conn:
                 notifications = await conn.fetch("""
                     SELECT 
                         notification_id,
@@ -1385,7 +1381,7 @@ class NotificationGenerationTool:
     async def clean_expired_notifications(self):
         """Clean up expired notifications."""
         try:
-            async with self.db_pool.acquire() as conn:
+            async with self.connection_pool.acquire() as conn:
                 deleted_count = await conn.fetchval("""
                     UPDATE notifications 
                     SET status = 'expired'
@@ -1404,7 +1400,7 @@ class NotificationGenerationTool:
     async def get_notification_analytics(self, user_id: str, days: int = 30) -> Dict[str, Any]:
         """Get notification analytics for a user."""
         try:
-            async with self.db_pool.acquire() as conn:
+            async with self.connection_pool.acquire() as conn:
                 # Get notification stats
                 stats = await conn.fetchrow("""
                     SELECT 

@@ -294,7 +294,7 @@ workflows:
         retry_count: 1
         input_mapping:
           historical_analysis: "analyze_historical_data.results"
-          prediction_context: "translate_query.prediction_context"
+          prediction_context: "translate_query.analysis_type"
           user_id: "user_id"
 
       - step_id: create_forecast_report
@@ -303,7 +303,7 @@ workflows:
         required: true
         retry_count: 2
         input_mapping:
-          predictions: "generate_predictions.predictions"
+          predictions: "generate_predictions.insights"
           historical_context: "analyze_historical_data.results"
           original_query: "original_query"
           user_id: "user_id"

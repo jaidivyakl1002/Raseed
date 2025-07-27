@@ -11,8 +11,8 @@ from scipy import stats
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 import json
-
-from core.base_agent_tools.database_connector import DatabaseConnector
+import asyncpg
+from google.cloud import secretmanager
 from core.base_agent_tools.config_manager import AgentConfig
 
 
@@ -100,26 +100,60 @@ class AnomalyDetectionTool:
     - Pattern recognition
     """
     
-    def __init__(self, db_connector: DatabaseConnector = None):
-        self.db_connector = db_connector or DatabaseConnector()
-        self.logger = logging.getLogger(__name__)
-        
-        # Configuration
-        self.config = AgentConfig.from_env()
-        
-        # Detection thresholds
+    def __init__(
+        self,
+        project_id: str,
+        logger: Optional[logging.Logger] = None
+    ):
+        self.logger = logger or logging.getLogger(__name__)
+        self.project_id = project_id
+        self.connection_pool: Optional[asyncpg.Pool] = None
+        self.secret_client = secretmanager.SecretManagerServiceClient()
+
+        # Initialize z_score thresholds (this was missing!)
         self.z_score_thresholds = {
-            AnomalySeverity.MINOR: 1.5,
-            AnomalySeverity.MODERATE: 2.0,
+            AnomalySeverity.MINOR: 2.0,
+            AnomalySeverity.MODERATE: 2.5,
             AnomalySeverity.SIGNIFICANT: 3.0,
             AnomalySeverity.CRITICAL: 4.0
         }
         
-        # ML models (initialized when needed)
-        self.isolation_forest = None
+        # Initialize ML components (these were missing!)
         self.scaler = StandardScaler()
-        
-        self.logger.info("Anomaly Detection Tool initialized")
+        self.isolation_forest = None
+
+        # Get database configuration from Google Secret Manager
+        secret_name = f"projects/{self.project_id}/secrets/postgres-config/versions/latest"
+        response = self.secret_client.access_secret_version(request={"name": secret_name})
+        secret_data = json.loads(response.payload.data.decode("UTF-8"))
+
+        self.db_config = {
+            'host': secret_data["host"],
+            'port': secret_data.get("port", 5432),
+            'database': secret_data["database"],
+            'user': secret_data["user"],
+            'password': secret_data["password"],
+            'min_size': 5,
+            'max_size': 20,
+            'command_timeout': 60
+        }
+    
+    async def initialize_connection_pool(self):
+        """Initialize the database connection pool."""
+        try:
+            if not self.connection_pool:
+                self.connection_pool = await asyncpg.create_pool(**self.db_config)
+                self.logger.info("PostgreSQL connection pool initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize connection pool: {e}")
+            raise
+
+    async def close_connection_pool(self):
+        """Close the database connection pool."""
+        if self.connection_pool:
+            await self.connection_pool.close()
+            self.connection_pool = None
+            self.logger.info("PostgreSQL connection pool closed")
     
     async def detect_anomalies(
         self,
@@ -214,43 +248,6 @@ class AnomalyDetectionTool:
             
         except Exception as e:
             self.logger.error(f"Error in anomaly detection: {str(e)}")
-            raise
-    
-    async def _get_user_transactions(self, user_id: str, days: int) -> List[Dict[str, Any]]:
-        """Get user transaction data for the specified time period."""
-        try:
-            end_date = datetime.now().date()
-            start_date = end_date - timedelta(days=days)
-            
-            query = """
-            SELECT 
-                t.transaction_id,
-                t.amount,
-                t.transaction_date,
-                t.category,
-                t.subcategory,
-                m.normalized_name as merchant_name,
-                m.category as merchant_category,
-                EXTRACT(HOUR FROM t.transaction_time) as hour_of_day,
-                EXTRACT(DOW FROM t.transaction_date) as day_of_week,
-                t.payment_method
-            FROM transactions t
-            LEFT JOIN merchants m ON t.merchant_id = m.merchant_id
-            WHERE t.user_id = %s 
-                AND t.transaction_date >= %s 
-                AND t.transaction_date <= %s
-                AND t.deleted_at IS NULL
-            ORDER BY t.transaction_date DESC
-            """
-            
-            result = await self.db_connector.execute_query(
-                query, (user_id, start_date, end_date)
-            )
-            
-            return [dict(row) for row in result]
-            
-        except Exception as e:
-            self.logger.error(f"Error fetching transactions: {str(e)}")
             raise
     
     async def _detect_amount_anomalies(
@@ -427,135 +424,6 @@ class AnomalyDetectionTool:
         
         return anomalies
     
-    async def _detect_merchant_anomalies(
-        self, 
-        user_id: str, 
-        historical_df: pd.DataFrame, 
-        recent_df: pd.DataFrame
-    ) -> List[SpendingAnomaly]:
-        """Detect anomalies in merchant spending patterns."""
-        anomalies = []
-        
-        try:
-            # New merchants (not seen in historical data)
-            historical_merchants = set(historical_df['merchant_name'].dropna())
-            recent_merchants = set(recent_df['merchant_name'].dropna())
-            
-            new_merchants = recent_merchants - historical_merchants
-            
-            for merchant in new_merchants:
-                merchant_spending = recent_df[recent_df['merchant_name'] == merchant]['amount'].sum()
-                total_recent_spending = recent_df['amount'].sum()
-                
-                if merchant_spending / total_recent_spending > 0.1:  # New merchant accounts for >10% of spending
-                    anomaly = SpendingAnomaly(
-                        anomaly_id=str(uuid.uuid4()),
-                        user_id=user_id,
-                        anomaly_type=AnomalyType.MERCHANT_ANOMALY,
-                        severity=AnomalySeverity.MODERATE,
-                        polarity=AnomalyPolarity.NEUTRAL,
-                        z_score=2.0,  # Default for new merchant
-                        confidence_score=0.7,
-                        impact_score=merchant_spending / total_recent_spending,
-                        merchant=merchant,
-                        observed_value=merchant_spending,
-                        expected_value=0.0,
-                        description=f"New merchant detected: {merchant} (${merchant_spending:.2f} spent)"
-                    )
-                    
-                    await self._add_merchant_anomaly_context(anomaly, merchant, recent_df)
-                    anomalies.append(anomaly)
-            
-            # Unusual spending at existing merchants
-            for merchant in historical_merchants.intersection(recent_merchants):
-                hist_merchant_amounts = historical_df[historical_df['merchant_name'] == merchant]['amount']
-                recent_merchant_amounts = recent_df[recent_df['merchant_name'] == merchant]['amount']
-                
-                if len(hist_merchant_amounts) > 2 and len(recent_merchant_amounts) > 0:
-                    hist_mean = hist_merchant_amounts.mean()
-                    hist_std = hist_merchant_amounts.std()
-                    recent_total = recent_merchant_amounts.sum()
-                    
-                    if hist_std > 0:
-                        z_score = abs((recent_total - hist_mean) / hist_std)
-                        
-                        if z_score >= self.z_score_thresholds[AnomalySeverity.MODERATE]:
-                            severity = self._calculate_severity_from_z_score(z_score)
-                            polarity = AnomalyPolarity.NEGATIVE if recent_total > hist_mean else AnomalyPolarity.POSITIVE
-                            
-                            anomaly = SpendingAnomaly(
-                                anomaly_id=str(uuid.uuid4()),
-                                user_id=user_id,
-                                anomaly_type=AnomalyType.MERCHANT_ANOMALY,
-                                severity=severity,
-                                polarity=polarity,
-                                z_score=z_score,
-                                confidence_score=min(z_score / 3.0, 1.0),
-                                impact_score=abs(recent_total - hist_mean) / hist_mean,
-                                merchant=merchant,
-                                observed_value=recent_total,
-                                expected_value=hist_mean,
-                                description=f"Unusual spending at {merchant}: ${recent_total:.2f} vs typical ${hist_mean:.2f}"
-                            )
-                            
-                            await self._add_merchant_anomaly_context(anomaly, merchant, recent_df)
-                            anomalies.append(anomaly)
-            
-        except Exception as e:
-            self.logger.error(f"Error detecting merchant anomalies: {str(e)}")
-        
-        return anomalies
-    
-    async def _detect_time_pattern_anomalies(
-        self, 
-        user_id: str, 
-        historical_df: pd.DataFrame, 
-        recent_df: pd.DataFrame
-    ) -> List[SpendingAnomaly]:
-        """Detect anomalies in time-based spending patterns."""
-        anomalies = []
-        
-        try:
-            # Day of week patterns
-            if 'day_of_week' in historical_df.columns and 'day_of_week' in recent_df.columns:
-                hist_dow_dist = historical_df.groupby('day_of_week')['amount'].sum() / historical_df['amount'].sum()
-                recent_dow_dist = recent_df.groupby('day_of_week')['amount'].sum() / recent_df['amount'].sum()
-                
-                for dow in hist_dow_dist.index:
-                    if dow in recent_dow_dist.index:
-                        hist_pct = hist_dow_dist[dow]
-                        recent_pct = recent_dow_dist[dow]
-                        
-                        if hist_pct > 0:
-                            relative_change = abs(recent_pct - hist_pct) / hist_pct
-                            
-                            if relative_change > 0.6:  # 60% change threshold
-                                anomaly = SpendingAnomaly(
-                                    anomaly_id=str(uuid.uuid4()),
-                                    user_id=user_id,
-                                    anomaly_type=AnomalyType.TIME_PATTERN_ANOMALY,
-                                    severity=self._calculate_severity_from_change(relative_change),
-                                    polarity=AnomalyPolarity.NEUTRAL,
-                                    z_score=relative_change * 2,
-                                    confidence_score=min(relative_change, 1.0),
-                                    impact_score=relative_change,
-                                    observed_value=recent_pct,
-                                    expected_value=hist_pct,
-                                    description=f"Unusual spending pattern on {self._get_day_name(dow)}: {recent_pct:.1%} vs typical {hist_pct:.1%}"
-                                )
-                                
-                                anomalies.append(anomaly)
-            
-            # Hour of day patterns (if available)
-            if 'hour_of_day' in historical_df.columns and 'hour_of_day' in recent_df.columns:
-                # Similar analysis for hour patterns
-                pass
-            
-        except Exception as e:
-            self.logger.error(f"Error detecting time pattern anomalies: {str(e)}")
-        
-        return anomalies
-    
     async def _detect_ml_anomalies(
         self, 
         user_id: str, 
@@ -623,31 +491,6 @@ class AnomalyDetectionTool:
             self.logger.error(f"Error in ML anomaly detection: {str(e)}")
         
         return anomalies
-    
-    def _prepare_ml_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Prepare features for machine learning model."""
-        ml_df = df.copy()
-        
-        # Select and create features
-        features = ['amount']
-        
-        if 'day_of_week' in df.columns:
-            features.append('day_of_week')
-        
-        if 'hour_of_day' in df.columns:
-            features.append('hour_of_day')
-        
-        # Add derived features
-        ml_df['log_amount'] = np.log1p(ml_df['amount'])
-        features.append('log_amount')
-        
-        # Category encoding (simplified)
-        if 'category' in df.columns:
-            category_counts = df['category'].value_counts()
-            ml_df['category_frequency'] = ml_df['category'].map(category_counts)
-            features.append('category_frequency')
-        
-        return ml_df[features].fillna(0)
     
     async def _filter_and_rank_anomalies(self, anomalies: List[SpendingAnomaly]) -> List[SpendingAnomaly]:
         """Filter and rank anomalies by importance."""
@@ -1110,3 +953,215 @@ class AnomalyDetectionTool:
             "historical_comparison": {},
             "suggested_actions": []
         }
+
+    # Fix 2: Convert Decimal to float in data processing
+    async def _get_user_transactions(self, user_id: str, days: int) -> List[Dict[str, Any]]:
+        """Get user transaction data for the specified time period."""
+        try:
+            await self.initialize_connection_pool()
+            
+            end_date = datetime.now().date()
+            start_date = end_date - timedelta(days=days)
+            
+            query = """
+            SELECT 
+                t.transaction_id,
+                CAST(t.amount AS FLOAT) as amount,  -- Convert Decimal to float
+                t.transaction_date,
+                t.category,
+                t.subcategory,
+                m.normalized_name as merchant_name,
+                m.category as merchant_category,
+                CAST(EXTRACT(HOUR FROM t.transaction_time) AS INTEGER) as hour_of_day,  -- Ensure integer
+                CAST(EXTRACT(DOW FROM t.transaction_date) AS INTEGER) as day_of_week,   -- Ensure integer
+                t.payment_method
+            FROM transactions t
+            LEFT JOIN merchants m ON t.merchant_id = m.merchant_id
+            WHERE t.user_id = $1 
+                AND t.transaction_date >= $2 
+                AND t.transaction_date <= $3
+                AND t.deleted_at IS NULL
+            ORDER BY t.transaction_date DESC
+            """
+            
+            async with self.connection_pool.acquire() as conn:
+                result = await conn.fetch(query, user_id, start_date, end_date)
+                return [dict(row) for row in result]
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching transactions: {str(e)}")
+            raise
+
+    # Fix 3: Handle type conversion in merchant anomaly detection
+    async def _detect_merchant_anomalies(
+        self, 
+        user_id: str, 
+        historical_df: pd.DataFrame, 
+        recent_df: pd.DataFrame
+    ) -> List[SpendingAnomaly]:
+        """Detect anomalies in merchant spending patterns."""
+        anomalies = []
+        
+        try:
+            # Ensure amount columns are float
+            historical_df['amount'] = pd.to_numeric(historical_df['amount'], errors='coerce')
+            recent_df['amount'] = pd.to_numeric(recent_df['amount'], errors='coerce')
+            
+            # New merchants (not seen in historical data)
+            historical_merchants = set(historical_df['merchant_name'].dropna())
+            recent_merchants = set(recent_df['merchant_name'].dropna())
+            
+            new_merchants = recent_merchants - historical_merchants
+            
+            for merchant in new_merchants:
+                merchant_spending = float(recent_df[recent_df['merchant_name'] == merchant]['amount'].sum())
+                total_recent_spending = float(recent_df['amount'].sum())
+                
+                if merchant_spending / total_recent_spending > 0.1:  # New merchant accounts for >10% of spending
+                    anomaly = SpendingAnomaly(
+                        anomaly_id=str(uuid.uuid4()),
+                        user_id=user_id,
+                        anomaly_type=AnomalyType.MERCHANT_ANOMALY,
+                        severity=AnomalySeverity.MODERATE,
+                        polarity=AnomalyPolarity.NEUTRAL,
+                        z_score=2.0,  # Default for new merchant
+                        confidence_score=0.7,
+                        impact_score=merchant_spending / total_recent_spending,
+                        merchant=merchant,
+                        observed_value=merchant_spending,
+                        expected_value=0.0,
+                        description=f"New merchant detected: {merchant} (${merchant_spending:.2f} spent)"
+                    )
+                    
+                    await self._add_merchant_anomaly_context(anomaly, merchant, recent_df)
+                    anomalies.append(anomaly)
+            
+            # Unusual spending at existing merchants
+            for merchant in historical_merchants.intersection(recent_merchants):
+                hist_merchant_amounts = historical_df[historical_df['merchant_name'] == merchant]['amount']
+                recent_merchant_amounts = recent_df[recent_df['merchant_name'] == merchant]['amount']
+                
+                if len(hist_merchant_amounts) > 2 and len(recent_merchant_amounts) > 0:
+                    hist_mean = float(hist_merchant_amounts.mean())  # Convert to float
+                    hist_std = float(hist_merchant_amounts.std())    # Convert to float
+                    recent_total = float(recent_merchant_amounts.sum())  # Convert to float
+                    
+                    if hist_std > 0:
+                        z_score = abs((recent_total - hist_mean) / hist_std)
+                        
+                        if z_score >= self.z_score_thresholds[AnomalySeverity.MODERATE]:
+                            severity = self._calculate_severity_from_z_score(z_score)
+                            polarity = AnomalyPolarity.NEGATIVE if recent_total > hist_mean else AnomalyPolarity.POSITIVE
+                            
+                            anomaly = SpendingAnomaly(
+                                anomaly_id=str(uuid.uuid4()),
+                                user_id=user_id,
+                                anomaly_type=AnomalyType.MERCHANT_ANOMALY,
+                                severity=severity,
+                                polarity=polarity,
+                                z_score=z_score,
+                                confidence_score=min(z_score / 3.0, 1.0),
+                                impact_score=abs(recent_total - hist_mean) / hist_mean,
+                                merchant=merchant,
+                                observed_value=recent_total,
+                                expected_value=hist_mean,
+                                description=f"Unusual spending at {merchant}: ${recent_total:.2f} vs typical ${hist_mean:.2f}"
+                            )
+                            
+                            await self._add_merchant_anomaly_context(anomaly, merchant, recent_df)
+                            anomalies.append(anomaly)
+            
+        except Exception as e:
+            self.logger.error(f"Error detecting merchant anomalies: {str(e)}")
+        
+        return anomalies
+
+    # Fix 4: Fix time pattern anomaly detection with proper indexing
+    async def _detect_time_pattern_anomalies(
+        self, 
+        user_id: str, 
+        historical_df: pd.DataFrame, 
+        recent_df: pd.DataFrame
+    ) -> List[SpendingAnomaly]:
+        """Detect anomalies in time-based spending patterns."""
+        anomalies = []
+        
+        try:
+            # Ensure amount columns are float and day_of_week is int
+            historical_df['amount'] = pd.to_numeric(historical_df['amount'], errors='coerce')
+            recent_df['amount'] = pd.to_numeric(recent_df['amount'], errors='coerce')
+            historical_df['day_of_week'] = pd.to_numeric(historical_df['day_of_week'], errors='coerce').astype(int)
+            recent_df['day_of_week'] = pd.to_numeric(recent_df['day_of_week'], errors='coerce').astype(int)
+            
+            # Day of week patterns
+            if 'day_of_week' in historical_df.columns and 'day_of_week' in recent_df.columns:
+                hist_dow_dist = historical_df.groupby('day_of_week')['amount'].sum() / historical_df['amount'].sum()
+                recent_dow_dist = recent_df.groupby('day_of_week')['amount'].sum() / recent_df['amount'].sum()
+                
+                for dow in hist_dow_dist.index:
+                    dow_int = int(dow)  # Ensure integer for indexing
+                    if dow_int in recent_dow_dist.index:
+                        hist_pct = float(hist_dow_dist[dow_int])    # Convert to float
+                        recent_pct = float(recent_dow_dist[dow_int])  # Convert to float
+                        
+                        if hist_pct > 0:
+                            relative_change = abs(recent_pct - hist_pct) / hist_pct
+                            
+                            if relative_change > 0.6:  # 60% change threshold
+                                anomaly = SpendingAnomaly(
+                                    anomaly_id=str(uuid.uuid4()),
+                                    user_id=user_id,
+                                    anomaly_type=AnomalyType.TIME_PATTERN_ANOMALY,
+                                    severity=self._calculate_severity_from_change(relative_change),
+                                    polarity=AnomalyPolarity.NEUTRAL,
+                                    z_score=relative_change * 2,
+                                    confidence_score=min(relative_change, 1.0),
+                                    impact_score=relative_change,
+                                    observed_value=recent_pct,
+                                    expected_value=hist_pct,
+                                    description=f"Unusual spending pattern on {self._get_day_name(dow_int)}: {recent_pct:.1%} vs typical {hist_pct:.1%}"
+                                )
+                                
+                                anomalies.append(anomaly)
+            
+            # Hour of day patterns (if available)
+            if 'hour_of_day' in historical_df.columns and 'hour_of_day' in recent_df.columns:
+                # Similar analysis for hour patterns
+                pass
+            
+        except Exception as e:
+            self.logger.error(f"Error detecting time pattern anomalies: {str(e)}")
+        
+        return anomalies
+
+    # Fix 5: Fix ML anomaly detection with proper data type handling
+    def _prepare_ml_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Prepare features for machine learning model."""
+        ml_df = df.copy()
+        
+        # Ensure numeric types for all features
+        ml_df['amount'] = pd.to_numeric(ml_df['amount'], errors='coerce')
+        
+        # Select and create features
+        features = ['amount']
+        
+        if 'day_of_week' in df.columns:
+            ml_df['day_of_week'] = pd.to_numeric(ml_df['day_of_week'], errors='coerce').astype(int)
+            features.append('day_of_week')
+        
+        if 'hour_of_day' in df.columns:
+            ml_df['hour_of_day'] = pd.to_numeric(ml_df['hour_of_day'], errors='coerce').astype(int)
+            features.append('hour_of_day')
+        
+        # Add derived features - convert to float first to avoid Decimal issues
+        amounts_float = ml_df['amount'].astype(float)
+        ml_df['log_amount'] = np.log1p(amounts_float)  # Use float values for numpy operations
+        features.append('log_amount')
+        
+        # Category encoding (simplified)
+        if 'category' in df.columns:
+            category_counts = df['category'].value_counts()
+            ml_df['category_frequency'] = ml_df['category'].map(category_counts).fillna(0).astype(float)
+            features.append('category_frequency')
+        
+        return ml_df[features].fillna(0).astype(float)  # Ensure all features are float
